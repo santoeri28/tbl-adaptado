@@ -1,0 +1,401 @@
+
+import re
+import pandas as pd
+from google.colab import files
+
+# =========================================================
+# CONFIGURAÇÕES (PROFESSOR EDITA AQUI)
+# =========================================================
+
+WEIGHT_INDIVIDUAL = 0.60
+WEIGHT_TEAM = 0.40
+FINAL_GRADE_SCALE = 10
+
+# ✅ GABARITO EM FORMATO SIMPLES (1 letra por questão, na ordem 1..N)
+# Exemplos:
+# 5 questões:  "CDBCA"
+# 6 questões:  "CDBCAC"
+# 10 questões: "CDBCACADBD"
+GABARITO = "CDBCAC"
+
+# Converte string para dicionário {1:"C", 2:"D", ...}
+ANSWER_KEY = {i + 1: letra.strip().upper() for i, letra in enumerate(GABARITO)}
+
+POINTS_BY_RANK = {1: 4, 2: 2, 3: 1, 4: 0}
+MAX_POINTS_PER_QUESTION = 4
+
+TIMESTAMP_COL = "Carimbo de data/hora"
+MATRICULA_COL_FORMS = "Qual é o número de sua matrícula?"
+
+OUTPUT_XLSX = "saida_notas_completa.xlsx"
+
+# =========================================================
+# FUNÇÕES AUXILIARES
+# =========================================================
+
+QUESTION_COL_PATTERN = re.compile(r"^QUESTÃO\s*(\d+)\s*\[([A-D])\]$", re.IGNORECASE)
+
+def clean_str(x):
+    return str(x).strip()
+
+def normalize_weights(wi, wt):
+    s = wi + wt
+    if s == 0:
+        return 0.6, 0.4
+    return wi / s, wt / s
+
+def safe_rank_to_points(v):
+    try:
+        r = int(v)
+    except Exception:
+        return 0
+    return POINTS_BY_RANK.get(r, 0)
+
+def points_to_percent(p):
+    return (p / MAX_POINTS_PER_QUESTION) * 100 if MAX_POINTS_PER_QUESTION else 0.0
+
+def build_question_map(columns):
+    qmap = {}
+    for col in columns:
+        m = QUESTION_COL_PATTERN.match(str(col).strip())
+        if m:
+            q = int(m.group(1))
+            opt = m.group(2).upper()
+            qmap.setdefault(q, {})[opt] = col
+    return qmap
+
+def infer_questions_from_sheet(columns):
+    """Detecta automaticamente as questões existentes na planilha."""
+    qmap = build_question_map(columns)
+    return sorted(qmap.keys())
+
+def detect_column(df, keywords):
+    cols = list(df.columns)
+    low = {c: str(c).lower() for c in cols}
+    for kw in keywords:
+        kw = kw.lower()
+        for c in cols:
+            if kw in low[c]:
+                return c
+    return None
+
+def latest_by_key(df, key_col):
+    if TIMESTAMP_COL in df.columns:
+        tmp = df.copy()
+        tmp[TIMESTAMP_COL] = pd.to_datetime(tmp[TIMESTAMP_COL], errors="coerce", dayfirst=True)
+        tmp = tmp.sort_values(TIMESTAMP_COL)
+        return tmp.groupby(key_col, as_index=False).tail(1)
+    return df.groupby(key_col, as_index=False).tail(1)
+
+def compute_scores_from_forms(df_forms, id_col_name, answer_key):
+    """
+    Calcula pontos/% por questão, total pontos, total %, média %.
+    Mantém apenas a submissão mais recente por id (se houver timestamp).
+    Retorna: df_latest, resumo_questoes, ranking_piores, total_max, questions
+    """
+    df = df_forms.copy()
+    df[id_col_name] = df[id_col_name].apply(clean_str)
+
+    qmap = build_question_map(df.columns.tolist())
+    questions = infer_questions_from_sheet(df.columns.tolist())
+
+    if not questions:
+        raise ValueError("Não encontrei colunas no formato 'QUESTÃO X [A]'...'[D]' no arquivo do Forms.")
+
+    # valida que o gabarito cobre todas as questões encontradas
+    missing_in_key = [q for q in questions if q not in answer_key]
+    if missing_in_key:
+        raise ValueError(
+            f"O gabarito (GABARITO/ANSWER_KEY) não contém estas questões presentes na planilha: {missing_in_key}"
+        )
+
+    # se gabarito tem questões a mais, avisa e ignora
+    extra_in_key = [q for q in answer_key.keys() if q not in questions]
+    if extra_in_key:
+        print(f"⚠️ Aviso: o gabarito tem questões que não existem nesta planilha e serão ignoradas: {extra_in_key}")
+
+    pts_cols, pct_cols = [], []
+
+    # valida colunas A-D e calcula
+    for q in questions:
+        for o in ["A", "B", "C", "D"]:
+            if o not in qmap.get(q, {}):
+                raise ValueError(f"Questão {q} está sem a coluna: QUESTÃO {q} [{o}]")
+
+        correct = str(answer_key[q]).upper().strip()
+        if correct not in ["A", "B", "C", "D"]:
+            raise ValueError(f"Gabarito inválido na questão {q}: {correct}")
+
+        col_correct = qmap[q][correct]
+        col_pts = f"Q{q:02d}_pontos"
+        col_pct = f"Q{q:02d}_pct"
+
+        df[col_pts] = df[col_correct].apply(safe_rank_to_points)
+        df[col_pct] = df[col_pts].apply(lambda p: round(points_to_percent(p), 1))
+
+        pts_cols.append(col_pts)
+        pct_cols.append(col_pct)
+
+    total_max = len(questions) * MAX_POINTS_PER_QUESTION
+
+    df["total_pontos"] = df[pts_cols].sum(axis=1)
+    df["total_pct_100"] = (df["total_pontos"] / total_max * 100).round(1)   # 0..100
+    df["media_pct"] = df[pct_cols].mean(axis=1).round(1)
+
+    df_latest = latest_by_key(df, id_col_name)
+
+    # resumo por questão
+    rows = []
+    for q in questions:
+        p = df_latest[f"Q{q:02d}_pontos"]
+        pct = df_latest[f"Q{q:02d}_pct"]
+        rows.append({
+            "questao": q,
+            "gabarito": str(answer_key[q]).upper(),
+            "media_pontos": round(float(p.mean()), 2),
+            "media_pct": round(float(pct.mean()), 1),
+            "pct_100 (4 pts)": round(float((p == MAX_POINTS_PER_QUESTION).mean() * 100), 1),
+            "pct_>=25 (>=1 pt)": round(float((p >= 1).mean() * 100), 1),
+        })
+
+    resumo = pd.DataFrame(rows).sort_values("questao").reset_index(drop=True)
+    ranking_piores = resumo.sort_values(["media_pct", "questao"], ascending=[True, True]).reset_index(drop=True)
+
+    return df_latest, resumo, ranking_piores, total_max, questions
+
+# =========================================================
+# 1) UPLOAD DOS 3 ARQUIVOS
+# =========================================================
+
+print("UPLOAD 1/3: Gestão de Notas (alunos e times) ...")
+up1 = files.upload()
+gestao_path = next(iter(up1.keys()))
+df_gestao = pd.read_excel(gestao_path, sheet_name=0)
+
+print("UPLOAD 2/3: Avaliação INDIVIDUAL (Google Forms .xlsx) ...")
+up2 = files.upload()
+ind_path = next(iter(up2.keys()))
+df_ind_forms = pd.read_excel(ind_path, sheet_name=0)
+
+print("UPLOAD 3/3: Avaliação EM TIME (Google Forms .xlsx) ...")
+up3 = files.upload()
+team_path = next(iter(up3.keys()))
+df_team_forms = pd.read_excel(team_path, sheet_name=0)
+
+# =========================================================
+# 2) BASE DE ALUNOS (Gestão)
+# =========================================================
+
+col_id = detect_column(df_gestao, ["matr", "matricula", "aluno_id", "id"])
+col_nome = detect_column(df_gestao, ["nome", "Nome do aluno", "Descrição", "Aluno"])
+col_time = detect_column(df_gestao, ["time", "equipe", "grupo"])
+
+if col_id is None or col_time is None:
+    raise ValueError(f"Não consegui identificar colunas na Gestão. Detectei: id={col_id}, nome={col_nome}, time={col_time}")
+
+base = df_gestao.copy()
+base["aluno_id"] = base[col_id].apply(clean_str)
+base["NOME"] = base[col_nome].apply(clean_str) if col_nome else ""
+base["TIME"] = base[col_time].apply(lambda x: str(x).strip().upper())
+
+# =========================================================
+# 3) INDIVIDUAL (ID = matrícula do aluno)
+# =========================================================
+
+id_col_ind = MATRICULA_COL_FORMS if MATRICULA_COL_FORMS in df_ind_forms.columns else detect_column(df_ind_forms, ["matr", "matricula", "aluno_id", "id"])
+if id_col_ind is None:
+    raise ValueError("Não encontrei a coluna de matrícula/aluno_id no Forms INDIVIDUAL.")
+
+df_ind = df_ind_forms.rename(columns={id_col_ind: "aluno_id"}).copy()
+df_ind_latest, resumo_ind, ranking_piores_ind, total_max, questions_ind = compute_scores_from_forms(df_ind, "aluno_id", ANSWER_KEY)
+
+# =========================================================
+# 4) TIME (ID = TIME)
+# =========================================================
+
+team_id_col = detect_column(df_team_forms, ["time", "equipe", "grupo"])
+if team_id_col is None:
+    if MATRICULA_COL_FORMS in df_team_forms.columns:
+        team_id_col = MATRICULA_COL_FORMS
+    else:
+        team_id_col = detect_column(df_team_forms, ["matr", "matricula", "id"])
+
+if team_id_col is None:
+    raise ValueError("Não encontrei a coluna identificadora do TIME no Forms de TIME.")
+
+df_team = df_team_forms.rename(columns={team_id_col: "TIME"}).copy()
+df_team["TIME"] = df_team["TIME"].apply(lambda x: str(x).strip().upper())
+
+df_team_latest, resumo_team, ranking_piores_team, total_max_team, questions_team = compute_scores_from_forms(df_team, "TIME", ANSWER_KEY)
+
+# (Opcional) se o time tiver conjunto diferente, avisa
+if questions_team != questions_ind:
+    print("⚠️ Aviso: o arquivo do TIME possui conjunto de questões diferente do INDIVIDUAL.")
+    print("INDIVIDUAL:", questions_ind)
+    print("TIME:", questions_team)
+
+# usamos as questões detectadas do INDIVIDUAL como referência principal
+questions = questions_ind
+TOTAL_MAX_POINTS = total_max
+
+# =========================================================
+# 5) RENOMEIA COLUNAS POR QUESTÃO (para NÃO colidir no merge)
+# =========================================================
+
+ind_keep = ["aluno_id", "total_pontos", "total_pct_100", "media_pct"] + \
+           [c for c in df_ind_latest.columns if re.match(r"^Q\d{2}_(pontos|pct)$", str(c))]
+ind_scores = df_ind_latest[ind_keep].copy()
+ind_scores["aluno_id"] = ind_scores["aluno_id"].apply(clean_str)
+
+rename_ind = {"total_pontos": "ind_pontos", "total_pct_100": "ind_pct_100", "media_pct": "ind_media_pct"}
+for q in questions:
+    rename_ind[f"Q{q:02d}_pontos"] = f"ind_Q{q:02d}_pontos"
+    rename_ind[f"Q{q:02d}_pct"] = f"ind_Q{q:02d}_pct"
+ind_scores = ind_scores.rename(columns=rename_ind)
+
+team_keep = ["TIME", "total_pontos", "total_pct_100", "media_pct"] + \
+            [c for c in df_team_latest.columns if re.match(r"^Q\d{2}_(pontos|pct)$", str(c))]
+team_scores = df_team_latest[team_keep].copy()
+
+rename_team = {"total_pontos": "time_pontos", "total_pct_100": "time_pct_100", "media_pct": "time_media_pct"}
+for q in questions:
+    # Se alguma questão não existir no time, evitamos KeyError
+    if f"Q{q:02d}_pontos" in team_scores.columns:
+        rename_team[f"Q{q:02d}_pontos"] = f"time_Q{q:02d}_pontos"
+    if f"Q{q:02d}_pct" in team_scores.columns:
+        rename_team[f"Q{q:02d}_pct"] = f"time_Q{q:02d}_pct"
+team_scores = team_scores.rename(columns=rename_team)
+
+# =========================================================
+# 6) MERGE FINAL
+# =========================================================
+
+df_final = base.merge(ind_scores, on="aluno_id", how="left").merge(team_scores, on="TIME", how="left")
+
+if df_final["ind_pontos"].isna().any():
+    falt = df_final[df_final["ind_pontos"].isna()][["aluno_id", "NOME", "TIME"]].drop_duplicates()
+    print("⚠️ Alunos sem nota INDIVIDUAL (não encontrados no Forms individual).")
+    display(falt.head(20))
+
+if df_final["time_pontos"].isna().any():
+    falt = df_final[df_final["time_pontos"].isna()][["TIME"]].drop_duplicates()
+    print("⚠️ TIMES sem nota (não encontrados no Forms time).")
+    display(falt.head(20))
+
+# =========================================================
+# 7) CÁLCULO FINAL
+# =========================================================
+
+wi, wt = normalize_weights(WEIGHT_INDIVIDUAL, WEIGHT_TEAM)
+
+df_final["Nota Individual"] = df_final["ind_pontos"].astype(float)
+df_final["Nota do Time"] = df_final["time_pontos"].astype(float)
+
+df_final["TOTAL Aluno"] = (wi * df_final["Nota Individual"] + wt * df_final["Nota do Time"]).round(2)
+df_final["TOTAL_frac"] = (df_final["TOTAL Aluno"] / TOTAL_MAX_POINTS).round(6)
+df_final["TOTAL_pct_100"] = (df_final["TOTAL_frac"] * 100).round(1)
+df_final["Nota (escala)"] = (df_final["TOTAL_frac"] * FINAL_GRADE_SCALE).round(6)
+
+# =========================================================
+# 8) RESUMOS
+# =========================================================
+
+classificacao_times = (
+    df_final.groupby("TIME", as_index=False)
+    .agg(
+        n_alunos=("aluno_id", "count"),
+        media_total_frac=("TOTAL_frac", "mean"),
+        media_total_pct_100=("TOTAL_pct_100", "mean"),
+        media_ind_pct_100=("ind_pct_100", "mean"),
+        media_time_pct_100=("time_pct_100", "mean"),
+    )
+)
+
+classificacao_times["media_total_frac"] = classificacao_times["media_total_frac"].round(6)
+classificacao_times["media_total_pct_100"] = classificacao_times["media_total_pct_100"].round(1)
+classificacao_times["media_ind_pct_100"] = classificacao_times["media_ind_pct_100"].round(1)
+classificacao_times["media_time_pct_100"] = classificacao_times["media_time_pct_100"].round(1)
+
+classificacao_times = classificacao_times.sort_values(["media_total_frac", "TIME"], ascending=[False, True]).reset_index(drop=True)
+
+gestao_notas_out = df_final[[
+    "aluno_id", "NOME", "TIME",
+    "Nota Individual", "Nota do Time",
+    "TOTAL Aluno", "TOTAL_frac", "TOTAL_pct_100", "Nota (escala)"
+]].copy().rename(columns={
+    "aluno_id": "Matrícula",
+    "TOTAL_frac": "%TOTAL (fração)",
+    "TOTAL_pct_100": "%TOTAL (0-100)",
+})
+
+# =========================================================
+# 9) DETALHES POR QUESTÃO
+# =========================================================
+
+cols_ind_q = []
+cols_time_q = []
+for q in questions:
+    cols_ind_q += [f"ind_Q{q:02d}_pontos", f"ind_Q{q:02d}_pct"]
+    # pode não existir se time tiver conjunto diferente
+    if f"time_Q{q:02d}_pontos" in df_final.columns:
+        cols_time_q += [f"time_Q{q:02d}_pontos", f"time_Q{q:02d}_pct"]
+
+detalhe_individual = df_final[["aluno_id", "NOME", "TIME"] + cols_ind_q + ["ind_pontos", "ind_pct_100", "ind_media_pct"]].copy()
+detalhe_individual = detalhe_individual.rename(columns={
+    "aluno_id": "Matrícula",
+    "ind_pontos": "Total_ind_pontos",
+    "ind_pct_100": "Total_ind_%",
+    "ind_media_pct": "Media_ind_%",
+})
+
+# detalhe por time
+cols_time_base = ["TIME"] + cols_time_q + ["time_pontos", "time_pct_100", "time_media_pct"]
+cols_time_base = [c for c in cols_time_base if c in df_final.columns]
+detalhe_times = df_final[cols_time_base].drop_duplicates(subset=["TIME"]).copy()
+detalhe_times = detalhe_times.rename(columns={
+    "time_pontos": "Total_time_pontos",
+    "time_pct_100": "Total_time_%",
+    "time_media_pct": "Media_time_%",
+})
+
+# =========================================================
+# 10) PARÂMETROS / GABARITO
+# =========================================================
+
+parametros = pd.DataFrame([
+    ["WEIGHT_INDIVIDUAL", WEIGHT_INDIVIDUAL],
+    ["WEIGHT_TEAM", WEIGHT_TEAM],
+    ["FINAL_GRADE_SCALE", FINAL_GRADE_SCALE],
+    ["MAX_POINTS_PER_QUESTION", MAX_POINTS_PER_QUESTION],
+    ["TOTAL_MAX_POINTS", TOTAL_MAX_POINTS],
+    ["QUESTOES_DETECTADAS", ", ".join(map(str, questions))],
+], columns=["Parametro", "Valor"])
+
+gabarito_df = pd.DataFrame([{"questao": q, "gabarito": str(ANSWER_KEY[q]).upper()} for q in questions])
+
+# =========================================================
+# 11) SALVAR XLSX E BAIXAR
+# =========================================================
+
+with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
+    gestao_notas_out.to_excel(writer, index=False, sheet_name="Gestao_Notas")
+    classificacao_times.to_excel(writer, index=False, sheet_name="Classificacao_times")
+
+    resumo_ind.to_excel(writer, index=False, sheet_name="Resumo_questoes_ind")
+    resumo_team.to_excel(writer, index=False, sheet_name="Resumo_questoes_time")
+
+    ranking_piores_ind.to_excel(writer, index=False, sheet_name="Ranking_piores_ind")
+    ranking_piores_team.to_excel(writer, index=False, sheet_name="Ranking_piores_time")
+
+    detalhe_individual.to_excel(writer, index=False, sheet_name="Detalhe_individual")
+    detalhe_times.to_excel(writer, index=False, sheet_name="Detalhe_times")
+
+    parametros.to_excel(writer, index=False, sheet_name="Parametros")
+    gabarito_df.to_excel(writer, index=False, sheet_name="Gabarito")
+
+print("✅ Arquivo gerado:", OUTPUT_XLSX)
+print("\nPrévia - Classificação dos TIMES:")
+display(classificacao_times.head(10))
+
+print("\nBaixando...")
+files.download(OUTPUT_XLSX)
